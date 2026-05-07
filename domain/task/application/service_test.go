@@ -10,6 +10,7 @@ import (
 
 	"todoe/domain/task/domain"
 	"todoe/domain/task/port"
+	"todoe/internal/event"
 )
 
 // ── fakes ────────────────────────────────────────────────────────────
@@ -23,12 +24,6 @@ type fakeRepo struct {
 
 	saveResult mo.Result[struct{}]
 	saveCalls  []domain.Task
-
-	updateResult mo.Result[struct{}]
-	updateCalls  []struct {
-		id     bson.ObjectID
-		status domain.Status
-	}
 }
 
 func (r *fakeRepo) Save(ctx context.Context, task domain.Task) mo.Result[struct{}] {
@@ -43,30 +38,22 @@ func (r *fakeRepo) FindByID(ctx context.Context, id bson.ObjectID) mo.Result[dom
 	r.findByIDCalls = append(r.findByIDCalls, id)
 	return r.findByIDResult
 }
-func (r *fakeRepo) UpdateStatus(ctx context.Context, id bson.ObjectID, status domain.Status) mo.Result[struct{}] {
-	r.updateCalls = append(r.updateCalls, struct {
-		id     bson.ObjectID
-		status domain.Status
-	}{id, status})
-	return r.updateResult
-}
 
 type publishedEvent struct {
-	name    string
-	payload any
+	event event.Event
 }
 
 type fakePublisher struct {
 	events []publishedEvent
 }
 
-func (p *fakePublisher) Publish(name string, payload any) {
-	p.events = append(p.events, publishedEvent{name, payload})
+func (p *fakePublisher) Publish(ctx context.Context, e event.Event) {
+	p.events = append(p.events, publishedEvent{e})
 }
 
 var (
 	_ port.Repository = (*fakeRepo)(nil)
-	_ port.Publisher  = (*fakePublisher)(nil)
+	_ event.Publisher = (*fakePublisher)(nil)
 )
 
 // ── tests ────────────────────────────────────────────────────────────
@@ -119,16 +106,16 @@ func TestService_CreateTask_PublishesCreatedEventWithPendingStatus(t *testing.T)
 	if len(pub.events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(pub.events))
 	}
-	ev := pub.events[0]
-	if ev.name != domain.EventCreated {
-		t.Errorf("event name=%q, want %q", ev.name, domain.EventCreated)
+	ev := pub.events[0].event
+	if ev.Type != domain.EventCreated {
+		t.Errorf("event type=%q, want %q", ev.Type, domain.EventCreated)
 	}
-	payload, ok := ev.payload.(domain.CreatedPayload)
+	payload, ok := ev.Payload.(domain.Task)
 	if !ok {
-		t.Fatalf("payload type=%T, want domain.CreatedPayload", ev.payload)
+		t.Fatalf("payload type=%T, want domain.Task", ev.Payload)
 	}
-	if payload.Task != task {
-		t.Errorf("payload Task != returned task\n got=%+v\nwant=%+v", payload.Task, task)
+	if payload != task {
+		t.Errorf("payload != returned task\n got=%+v\nwant=%+v", payload, task)
 	}
 }
 
@@ -174,35 +161,14 @@ func TestService_ChangeStatus_RejectsInvalidStatus(t *testing.T) {
 	pub := &fakePublisher{}
 	svc := NewService(repo, pub)
 
-	res := svc.ChangeStatus(context.Background(), bson.NewObjectID(), domain.Status("weird"))
+	task := domain.Task{ID: bson.NewObjectID(), Title: "x", Status: domain.StatusPending}
+	res := svc.ChangeStatus(context.Background(), task, domain.Status("weird"))
 
 	if !res.IsError() {
 		t.Fatalf("expected error, got value")
 	}
 	if !errors.Is(res.Error(), ErrInvalidStatus) {
 		t.Fatalf("expected ErrInvalidStatus, got %v", res.Error())
-	}
-	if len(repo.findByIDCalls) != 0 {
-		t.Errorf("expected no FindByID call, got %d", len(repo.findByIDCalls))
-	}
-	if len(pub.events) != 0 {
-		t.Errorf("expected no publish, got %d", len(pub.events))
-	}
-}
-
-func TestService_ChangeStatus_PropagatesNotFound(t *testing.T) {
-	notFound := errors.New("not found")
-	repo := &fakeRepo{findByIDResult: mo.Err[domain.Task](notFound)}
-	pub := &fakePublisher{}
-	svc := NewService(repo, pub)
-
-	res := svc.ChangeStatus(context.Background(), bson.NewObjectID(), domain.StatusInProgress)
-
-	if !res.IsError() {
-		t.Fatalf("expected error, got value")
-	}
-	if !errors.Is(res.Error(), notFound) {
-		t.Fatalf("expected wrapped not-found error, got %v", res.Error())
 	}
 	if len(pub.events) != 0 {
 		t.Errorf("expected no publish, got %d", len(pub.events))
@@ -212,11 +178,11 @@ func TestService_ChangeStatus_PropagatesNotFound(t *testing.T) {
 func TestService_ChangeStatus_PublishesEventAndReturnsUpdatedTask(t *testing.T) {
 	id := bson.NewObjectID()
 	initial := domain.Task{ID: id, Title: "x", Status: domain.StatusPending}
-	repo := &fakeRepo{findByIDResult: mo.Ok(initial)}
+	repo := &fakeRepo{}
 	pub := &fakePublisher{}
 	svc := NewService(repo, pub)
 
-	res := svc.ChangeStatus(context.Background(), id, domain.StatusInProgress)
+	res := svc.ChangeStatus(context.Background(), initial, domain.StatusInProgress)
 
 	if res.IsError() {
 		t.Fatalf("unexpected error: %v", res.Error())
@@ -225,22 +191,25 @@ func TestService_ChangeStatus_PublishesEventAndReturnsUpdatedTask(t *testing.T) 
 	if got.Status != domain.StatusInProgress {
 		t.Errorf("status=%v, want %v", got.Status, domain.StatusInProgress)
 	}
-	if got.ID != id {
-		t.Errorf("id=%v, want %v", got.ID, id)
+	if got.ID == id {
+		t.Errorf("expected new ID (append-only), got same id %v", id)
+	}
+	if got.OriginID == nil || *got.OriginID != id {
+		t.Errorf("expected OriginID=%v, got %v", id, got.OriginID)
 	}
 
 	if len(pub.events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(pub.events))
 	}
-	ev := pub.events[0]
-	if ev.name != domain.EventStatusChanged {
-		t.Errorf("event name=%q, want %q", ev.name, domain.EventStatusChanged)
+	ev := pub.events[0].event
+	if ev.Type != domain.EventStatusChanged {
+		t.Errorf("event type=%q, want %q", ev.Type, domain.EventStatusChanged)
 	}
-	payload, ok := ev.payload.(domain.StatusChangedPayload)
+	payload, ok := ev.Payload.(domain.Task)
 	if !ok {
-		t.Fatalf("payload type=%T, want StatusChangedPayload", ev.payload)
+		t.Fatalf("payload type=%T, want domain.Task", ev.Payload)
 	}
-	if payload.TaskID != id || payload.Status != domain.StatusInProgress {
-		t.Errorf("payload=%+v, want {TaskID: %v, Status: %v}", payload, id, domain.StatusInProgress)
+	if payload.Status != domain.StatusInProgress {
+		t.Errorf("payload status=%v, want %v", payload.Status, domain.StatusInProgress)
 	}
 }

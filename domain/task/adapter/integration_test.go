@@ -18,6 +18,9 @@ import (
 // setupRepo connects to mongo (MONGO_URI env or local default). Skips the test
 // when mongo isn't reachable, so `go test ./...` stays green on a dev box
 // without compose running but exercises the full path when it is.
+// setupRepo connects to mongo (MONGO_URI env or local default). Skips the test
+// when mongo isn't reachable, so `go test ./...` stays green on a dev box
+// without compose running but exercises the full path when it is.
 func setupRepo(t *testing.T) *MongoRepository {
 	t.Helper()
 
@@ -110,7 +113,7 @@ func TestMongoRepository_FindAll_IncludesSavedTask(t *testing.T) {
 	}
 }
 
-func TestMongoRepository_UpdateStatus(t *testing.T) {
+func TestMongoRepository_ChangeStatusViaAppend(t *testing.T) {
 	repo := setupRepo(t)
 	task := sampleTask()
 	removeAfterTest(t, repo, task.ID)
@@ -119,11 +122,16 @@ func TestMongoRepository_UpdateStatus(t *testing.T) {
 	if r := repo.Save(ctx, task); r.IsError() {
 		t.Fatalf("Save: %v", r.Error())
 	}
-	if r := repo.UpdateStatus(ctx, task.ID, domain.StatusInProgress); r.IsError() {
-		t.Fatalf("UpdateStatus: %v", r.Error())
+
+	// "Update" = save a new record referencing the original ID
+	next := task.ChangeStatus(domain.StatusInProgress)
+	removeAfterTest(t, repo, next.ID)
+	if r := repo.Save(ctx, next); r.IsError() {
+		t.Fatalf("Save status change: %v", r.Error())
 	}
 
-	res := repo.FindByID(ctx, task.ID)
+	// The latest record has the new status
+	res := repo.FindByID(ctx, next.ID)
 	if res.IsError() {
 		t.Fatalf("FindByID: %v", res.Error())
 	}
@@ -134,13 +142,16 @@ func TestMongoRepository_UpdateStatus(t *testing.T) {
 
 func TestSaveHandler_PersistsTaskFromBus(t *testing.T) {
 	repo := setupRepo(t)
-	bus := event.NewBus()
+	bus := event.NewEventBus()
 	bus.Subscribe(domain.EventCreated, NewSaveHandler(repo))
 
 	task := sampleTask()
 	removeAfterTest(t, repo, task.ID)
 
-	bus.Publish(domain.EventCreated, domain.CreatedPayload{Task: task})
+	bus.Publish(context.Background(), event.Event{
+		Type:    domain.EventCreated,
+		Payload: task,
+	})
 
 	res := repo.FindByID(context.Background(), task.ID)
 	if res.IsError() {
@@ -151,10 +162,10 @@ func TestSaveHandler_PersistsTaskFromBus(t *testing.T) {
 	}
 }
 
-func TestUpdateStatusHandler_UpdatesStatusFromBus(t *testing.T) {
+func TestSaveHandler_PersistsStatusChangeFromBus(t *testing.T) {
 	repo := setupRepo(t)
-	bus := event.NewBus()
-	bus.Subscribe(domain.EventStatusChanged, NewUpdateStatusHandler(repo))
+	bus := event.NewEventBus()
+	bus.Subscribe(domain.EventStatusChanged, NewSaveHandler(repo))
 
 	task := sampleTask()
 	removeAfterTest(t, repo, task.ID)
@@ -162,12 +173,15 @@ func TestUpdateStatusHandler_UpdatesStatusFromBus(t *testing.T) {
 		t.Fatalf("Save: %v", r.Error())
 	}
 
-	bus.Publish(domain.EventStatusChanged, domain.StatusChangedPayload{
-		TaskID: task.ID,
-		Status: domain.StatusDone,
+	next := task.ChangeStatus(domain.StatusDone)
+	removeAfterTest(t, repo, next.ID)
+
+	bus.Publish(context.Background(), event.Event{
+		Type:    domain.EventStatusChanged,
+		Payload: next,
 	})
 
-	res := repo.FindByID(context.Background(), task.ID)
+	res := repo.FindByID(context.Background(), next.ID)
 	if res.IsError() {
 		t.Fatalf("FindByID: %v", res.Error())
 	}

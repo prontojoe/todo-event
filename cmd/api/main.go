@@ -14,7 +14,10 @@ import (
 	healthhttp "todoe/internal/health/adapter/http"
 	healthapp "todoe/internal/health/application"
 
+	"todoe/internal/event"
+
 	taskadapter "todoe/domain/task/adapter"
+	taskdomain "todoe/domain/task/domain"
 	taskhttp "todoe/domain/task/adapter/http"
 	taskapplication "todoe/domain/task/application"
 )
@@ -36,7 +39,10 @@ func main() {
 	healthHandler := healthhttp.NewHandler(healthService)
 
 	taskRepo := taskadapter.NewMongoRepository(clientIO)
-	taskService := taskapplication.NewService(taskRepo)
+	taskBus := event.NewEventBus()
+	taskBus.Subscribe(taskdomain.EventCreated, taskadapter.NewSaveHandler(taskRepo))
+	taskBus.Subscribe(taskdomain.EventStatusChanged, taskadapter.NewSaveHandler(taskRepo))
+	taskService := taskapplication.NewService(taskRepo, taskBus)
 	taskHandler := taskhttp.NewHandler(taskService)
 
 	app := fiber.New()
