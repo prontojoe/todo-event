@@ -16,6 +16,8 @@ import (
 
 	"todoe/internal/event"
 
+	auditadapter "todoe/internal/audit/adapter"
+
 	taskadapter "todoe/domain/task/adapter"
 	taskdomain "todoe/domain/task/domain"
 	taskhttp "todoe/domain/task/adapter/http"
@@ -42,6 +44,9 @@ func main() {
 	taskBus := event.NewEventBus()
 	taskBus.Subscribe(taskdomain.EventCreated, taskadapter.NewSaveHandler(taskRepo))
 	taskBus.Subscribe(taskdomain.EventStatusChanged, taskadapter.NewSaveHandler(taskRepo))
+	auditRepo := auditadapter.NewMongoRepository(clientIO)
+	taskBus.Subscribe(taskdomain.EventCreated, auditadapter.NewHandler(auditRepo).Handle)
+	taskBus.Subscribe(taskdomain.EventStatusChanged, auditadapter.NewHandler(auditRepo).Handle)
 	taskService := taskapplication.NewService(taskRepo, taskBus)
 	taskHandler := taskhttp.NewHandler(taskService)
 
